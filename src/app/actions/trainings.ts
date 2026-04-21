@@ -199,30 +199,37 @@ export async function setMonthlyPayer(
   )
   if (error) throw new Error(error.message)
 
-  // Quando DESMARCA mensalista, propaga pros attendances do mês: qualquer
-  // treino que estava com `payment_type='monthly'` vira `'drop_in'` + volta
-  // pra 'pending' (o atleta agora paga por treino). Sem esse passo os cards
-  // antigos continuariam mostrando "Mensal" e o financeiro ficaria
-  // inconsistente.
-  if (!isMonthlyPayer) {
-    const mm = String(month).padStart(2, '0')
-    const lastDay = new Date(year, month, 0).getDate()
-    const startDate = `${year}-${mm}-01`
-    const endDate = `${year}-${mm}-${String(lastDay).padStart(2, '0')}`
+  // Propaga pros attendances do mês:
+  //   • MARCA mensalista (true) → todo treino do mês do atleta vira
+  //     `type='monthly'` + `status='pending'`, sobrescrevendo inclusive
+  //     drop_in 'paid'/'no_payment' anteriores (owner: "pagamento fica
+  //     pendente até trocar pra pago ou isento"). Intencional resetar:
+  //     a cobrança passa a ser agregada na mensalidade, não por treino.
+  //   • DESMARCA mensalista (false) → converte SÓ as rows que estavam
+  //     `type='monthly'` de volta pra `drop_in` + `pending`. Preserva
+  //     edits anteriores de drop_in/outros tipos.
+  const mm = String(month).padStart(2, '0')
+  const lastDay = new Date(year, month, 0).getDate()
+  const startDate = `${year}-${mm}-01`
+  const endDate = `${year}-${mm}-${String(lastDay).padStart(2, '0')}`
 
-    const { data: monthTrainings } = await supabase
-      .from('trainings')
-      .select('id')
-      .eq('category_id', categoryId)
-      .eq('organization_id', orgId)
-      .gte('date', startDate)
-      .lte('date', endDate)
+  const { data: monthTrainings } = await supabase
+    .from('trainings')
+    .select('id')
+    .eq('category_id', categoryId)
+    .eq('organization_id', orgId)
+    .gte('date', startDate)
+    .lte('date', endDate)
 
-    const trainingIds = (monthTrainings ?? []).map((t) => t.id)
-    if (trainingIds.length > 0) {
-      // Converte SÓ as rows com payment_type='monthly' — não mexe em
-      // attendances já classificadas como drop_in/outros (respeita edits
-      // manuais anteriores do coord).
+  const trainingIds = (monthTrainings ?? []).map((t) => t.id)
+  if (trainingIds.length > 0) {
+    if (isMonthlyPayer) {
+      await supabase
+        .from('member_attendances')
+        .update({ payment_type: 'monthly', payment_status: 'pending' })
+        .in('training_id', trainingIds)
+        .eq('member_id', memberId)
+    } else {
       await supabase
         .from('member_attendances')
         .update({ payment_type: 'drop_in', payment_status: 'pending' })

@@ -492,6 +492,23 @@ function CategoryView({
     // Sempre atualiza presença primeiro
     handleAttendance(trainingId, memberId, status)
 
+    // Se marcou PRESENTE vindo de um treino "Sem pagamento" (não-mensalista),
+    // auto-flip pra Avulso + Pendente. Intenção: quando atleta estava marcado
+    // como Faltou/Sem pagamento e muda pra Presente, o treino passa a gerar
+    // cobrança (drop_in) automaticamente — coord troca pra Pago/Isento depois.
+    // Mensalistas são ignorados: o tipo do mês deles não muda por presença.
+    if (status === 'present' && !isMonthly && currentPaymentStatus === 'no_payment') {
+      startTransition(async () => {
+        try {
+          await setTrainingPayment(trainingId, memberId, 'drop_in', 'pending', orgOpts)
+          router.refresh()
+        } catch (err) {
+          console.error('[handleAttendanceWithPrompt presentReset]', err)
+        }
+      })
+      return
+    }
+
     // Condições pra NÃO perguntar
     if (status !== 'absent') return
     // Double-gate contra mensalista: `isMonthly` do monthly_payments OU
@@ -1495,7 +1512,15 @@ function TrainingDayCard({
 
                 // Status efetivo: se tem attendance, usa o salvo; senão cai
                 // nos defaults (futuro = no_payment, passado = pending).
-                const effectiveStatus = (att?.payment_status ?? defaults.status) as string
+                //
+                // Mensalistas ignoram o default "no_payment" pra futuros:
+                // se o atleta é mensalista, o status "virtual" pra treinos
+                // sem row é 'pending' (a cobrança do mês fica pendente até
+                // o coord marcar Pago/Isento). Antes, futuros de mensalista
+                // apareciam como "Sem pagamento" contradizendo o TIPO Mensal.
+                const effectiveStatus = (
+                  att?.payment_status ?? (isMonthly ? 'pending' : defaults.status)
+                ) as string
                 // Tipo efetivo: `monthly_payments` é a SOURCE OF TRUTH pra
                 // mensalista do mês. Se `isMonthly=true`, o tipo é SEMPRE
                 // 'monthly' mesmo que o attendance ainda tenha payment_type
@@ -1593,6 +1618,8 @@ function TrainingDayCard({
                         ) : (
                           <TypeSelect
                             currentType={effectiveType}
+                            hasDropIn={category.has_drop_in}
+                            hasMonthly={category.has_monthly}
                             onChange={(newType) => {
                               if (newType === 'monthly') {
                                 onToggleMonthly(m.id, true)
@@ -1733,15 +1760,26 @@ const STATUS_DOT: Record<string, string> = {
  *   • `currentType = 'monthly'`  → atleta é mensalista
  *   • `currentType = 'drop_in'`  → avulso
  *   • `currentType = null`       → sem pagamento (mostra como 'no_payment')
+ *
+ * Opções filtradas pelas flags `has_drop_in` e `has_monthly` da categoria:
+ * se a categoria não aceita avulso/mensal, a opção não aparece no dropdown.
+ * "Sem pagamento" é sempre uma opção (fallback de escape).
  */
 function TypeSelect({
-  currentType, onChange, disabled,
+  currentType, onChange, disabled, hasDropIn, hasMonthly,
 }: {
   currentType: string | null
   onChange: (newType: 'drop_in' | 'monthly' | 'no_payment') => void
   disabled: boolean
+  hasDropIn: boolean
+  hasMonthly: boolean
 }) {
   const effective = currentType ?? 'no_payment'
+  const options = (['drop_in', 'monthly', 'no_payment'] as const).filter((t) => {
+    if (t === 'drop_in') return hasDropIn
+    if (t === 'monthly') return hasMonthly
+    return true
+  })
   return (
     <Select
       value={effective}
@@ -1760,7 +1798,7 @@ function TypeSelect({
         <SelectValue />
       </SelectTrigger>
       <SelectContent align="start" alignItemWithTrigger={false}>
-        {(['drop_in', 'monthly', 'no_payment'] as const).map((t) => (
+        {options.map((t) => (
           <SelectItem key={t} value={t} className="text-xs">
             <span className={`inline-block h-2 w-2 rounded-full shrink-0 ${TYPE_DOT[t]}`} />
             {TYPE_ITEMS[t]}
