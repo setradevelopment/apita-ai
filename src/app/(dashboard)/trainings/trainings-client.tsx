@@ -19,6 +19,9 @@ import { Textarea } from '@/components/ui/textarea'
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
+import {
+  Tabs, TabsContent, TabsList, TabsTrigger,
+} from '@/components/ui/tabs'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import {
   setAttendance,
@@ -289,6 +292,15 @@ function CategoryView({
     for (const mp of monthlyPayments) m.set(mp.member_id, mp)
     return m
   }, [monthlyPayments])
+
+  // Subconjunto de `members` que são mensalistas no mês/ano atuais.
+  // Alimenta a aba "Mensalistas" (só aparece se a categoria tiver
+  // `has_monthly=true`). Quando zero, a aba mostra estado vazio com
+  // botão que rola a tela até o `MonthlyPayersPanel` pro coord cadastrar.
+  const monthlyPayers = useMemo(
+    () => members.filter((m) => monthlyByMember.get(m.id)?.is_monthly_payer),
+    [members, monthlyByMember],
+  )
 
   // Lista agregada de confirmações pendentes (attendances com
   // payment_status='awaiting_confirmation'). Aparece em banner no topo
@@ -811,40 +823,132 @@ function CategoryView({
         />
       )}
 
-      {/* Painel de mensalistas do mês */}
-      <MonthlyPayersPanel
-        members={members}
-        category={category}
-        month={month} year={year}
-        monthlyByMember={monthlyByMember}
-        onToggleMonthlyPayer={handleToggleMonthlyPayer}
-        onSetStatus={handleMonthlyStatus}
-        disabled={isPending}
-      />
-
-      {/* Cards de treino (um por dia) */}
-      <div className="space-y-3">
-        {trainings.map((t) => (
-          <TrainingDayCard
-            key={t.id}
-            training={t}
-            category={category}
-            members={members}
-            attendances={attendances}
-            monthlyByMember={monthlyByMember}
-            onAttendance={handleAttendanceWithPrompt}
-            onDropInStatus={handleDropInStatus}
-            onSetType={handleSetPaymentType}
-            onToggleMonthly={handleToggleMonthlyPayer}
-            onCancelRequest={() => { setCancelReason(''); setCancelState({ id: t.id, date: t.date }) }}
-            onReactivate={() => handleReactivate(t.id)}
-            disabled={isPending}
-            bulkMode
-            selectedKeys={selectedKeys}
-            onToggleKey={toggleKey}
-          />
-        ))}
+      {/* Painel de mensalistas do mês.
+          id usado pelo botão da aba "Mensalistas" (estado vazio) pra rolar
+          até aqui via scrollIntoView. */}
+      <div id="monthly-payers-panel-anchor">
+        <MonthlyPayersPanel
+          members={members}
+          category={category}
+          month={month} year={year}
+          monthlyByMember={monthlyByMember}
+          onToggleMonthlyPayer={handleToggleMonthlyPayer}
+          onSetStatus={handleMonthlyStatus}
+          disabled={isPending}
+        />
       </div>
+
+      {/* Cards de treino (um por dia).
+          - Se `category.has_monthly` for true, envolvemos em abas [Todos]
+            e [Mensalistas]. Em "Mensalistas" filtramos `members` pro
+            subconjunto `monthlyPayers`; se vazio, mostra empty state com
+            botão que rola até o painel acima.
+          - Se `has_monthly` for false, renderiza direto a lista (sem abas).
+          Nos dois casos, o `TrainingDayCard` já marca mensalistas com a
+          coroa verde internamente (via `monthlyByMember`). */}
+      {category.has_monthly ? (
+        <Tabs defaultValue="todos">
+          <TabsList>
+            <TabsTrigger value="todos">Todos</TabsTrigger>
+            <TabsTrigger value="mensalistas">Mensalistas</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="todos" className="space-y-3">
+            {trainings.map((t) => (
+              <TrainingDayCard
+                key={t.id}
+                training={t}
+                category={category}
+                members={members}
+                attendances={attendances}
+                monthlyByMember={monthlyByMember}
+                onAttendance={handleAttendanceWithPrompt}
+                onDropInStatus={handleDropInStatus}
+                onSetType={handleSetPaymentType}
+                onToggleMonthly={handleToggleMonthlyPayer}
+                onCancelRequest={() => { setCancelReason(''); setCancelState({ id: t.id, date: t.date }) }}
+                onReactivate={() => handleReactivate(t.id)}
+                disabled={isPending}
+                bulkMode
+                selectedKeys={selectedKeys}
+                onToggleKey={toggleKey}
+              />
+            ))}
+          </TabsContent>
+
+          <TabsContent value="mensalistas" className="space-y-3">
+            {monthlyPayers.length === 0 ? (
+              <div className="bg-card rounded-xl border border-dashed border-border/60 py-12 text-center">
+                <Crown className="h-6 w-6 mx-auto text-muted-foreground/40 mb-2" />
+                <p className="text-sm text-muted-foreground font-medium">
+                  Nenhum mensalista cadastrado neste mês
+                </p>
+                <p className="text-[11px] text-muted-foreground/70 mt-1 mb-4">
+                  Cadastre quem é mensalista no painel acima ou clique abaixo.
+                </p>
+                <Button
+                  type="button"
+                  variant="default"
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={() => {
+                    document
+                      .getElementById('monthly-payers-panel-anchor')
+                      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                  }}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  Cadastrar mensalistas
+                </Button>
+              </div>
+            ) : (
+              trainings.map((t) => (
+                <TrainingDayCard
+                  key={t.id}
+                  training={t}
+                  category={category}
+                  members={monthlyPayers}
+                  attendances={attendances}
+                  monthlyByMember={monthlyByMember}
+                  onAttendance={handleAttendanceWithPrompt}
+                  onDropInStatus={handleDropInStatus}
+                  onSetType={handleSetPaymentType}
+                  onToggleMonthly={handleToggleMonthlyPayer}
+                  onCancelRequest={() => { setCancelReason(''); setCancelState({ id: t.id, date: t.date }) }}
+                  onReactivate={() => handleReactivate(t.id)}
+                  disabled={isPending}
+                  bulkMode
+                  selectedKeys={selectedKeys}
+                  onToggleKey={toggleKey}
+                />
+              ))
+            )}
+          </TabsContent>
+        </Tabs>
+      ) : (
+        <div className="space-y-3">
+          {trainings.map((t) => (
+            <TrainingDayCard
+              key={t.id}
+              training={t}
+              category={category}
+              members={members}
+              attendances={attendances}
+              monthlyByMember={monthlyByMember}
+              onAttendance={handleAttendanceWithPrompt}
+              onDropInStatus={handleDropInStatus}
+              onSetType={handleSetPaymentType}
+              onToggleMonthly={handleToggleMonthlyPayer}
+              onCancelRequest={() => { setCancelReason(''); setCancelState({ id: t.id, date: t.date }) }}
+              onReactivate={() => handleReactivate(t.id)}
+              disabled={isPending}
+              bulkMode
+              selectedKeys={selectedKeys}
+              onToggleKey={toggleKey}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Dialog de cancelamento */}
       <Dialog open={cancelState !== null} onOpenChange={(o) => !o && setCancelState(null)}>
