@@ -1502,9 +1502,17 @@ function TrainingDayCard({
                 // obsoleto (inconsistência transitória resolvida na próxima
                 // ação). Evita Gabriel aparecer como Avulso quando o coord
                 // já o promoveu a mensalista.
+                //
+                // Invariante: tipo e status "Sem pagamento" andam juntos — se
+                // o status efetivo é `no_payment`, o tipo também deve exibir
+                // "Sem pagamento" (null). Sem esse guard, atleta em treino
+                // passado com tipo salvo=null caía no fallback `defaults.type`
+                // = 'drop_in' e aparecia como "Avulso" contradizendo o status.
                 const effectiveType = isMonthly
                   ? 'monthly'
-                  : (att?.payment_type ?? defaults.type)
+                  : effectiveStatus === 'no_payment'
+                    ? null
+                    : (att?.payment_type ?? defaults.type)
                 const isAttendanceAwaiting = effectiveStatus === 'awaiting_confirmation'
 
                 const bulkKey = `${training.id}:${m.id}`
