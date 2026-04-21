@@ -648,54 +648,64 @@ function CategoryView({
     setBulkPending(true)
     setBulkProgress({ done: 0, total })
 
-    try {
-      let done = 0
+    // Tick é thread-safe via functional update — múltiplos `Promise.all`
+    // paralelos terminam em ordem imprevisível, então o update tem que
+    // usar o valor anterior e não uma closure local.
+    function tick() {
+      setBulkProgress((prev) => prev ? { done: prev.done + 1, total: prev.total } : null)
+    }
 
+    try {
       if (action === 'attendance') {
         const status = value as 'present' | 'absent'
-        for (const { trainingId, memberId } of pairs) {
-          await setAttendance(trainingId, memberId, status, orgOpts)
-          done++
-          setBulkProgress({ done, total })
-        }
+        // Paraleliza todas as presenças — cada setAttendance é independente.
+        await Promise.all(
+          pairs.map(({ trainingId, memberId }) =>
+            setAttendance(trainingId, memberId, status, orgOpts).then(tick),
+          ),
+        )
       } else if (action === 'type') {
         if (value === 'monthly') {
           // Promove cada atleta único como mensalista do mês — propaga
-          // pros treinos dele automaticamente.
-          for (const memberId of uniqueMembers) {
-            await setMonthlyPayer(memberId, category.id, month, year, true, orgOpts)
-            done++
-            setBulkProgress({ done, total })
-          }
+          // pros treinos dele automaticamente. Paraleliza por atleta
+          // (cada setMonthlyPayer é independente do outro).
+          await Promise.all(
+            uniqueMembers.map((memberId) =>
+              setMonthlyPayer(memberId, category.id, month, year, true, orgOpts).then(tick),
+            ),
+          )
         } else {
           // Desmarca mensalista (se fosse) via setMonthlyPayer(false), que já
           // converte 'monthly' → 'drop_in' automaticamente nos treinos do mês.
-          for (const memberId of uniqueMembers) {
-            await setMonthlyPayer(memberId, category.id, month, year, false, orgOpts)
-            done++
-            setBulkProgress({ done, total })
-          }
+          // Fase 1: unset mensalista em paralelo.
+          await Promise.all(
+            uniqueMembers.map((memberId) =>
+              setMonthlyPayer(memberId, category.id, month, year, false, orgOpts).then(tick),
+            ),
+          )
           if (value === 'no_payment') {
-            // Para "sem pagamento", ainda seta o status nos treinos selecionados.
-            for (const { trainingId, memberId } of pairs) {
-              await setTrainingPayment(trainingId, memberId, null, 'no_payment', orgOpts)
-              done++
-              setBulkProgress({ done, total })
-            }
+            // Fase 2: seta no_payment nos treinos específicos (depende da
+            // fase 1 ter terminado — setMonthlyPayer pode tocar nas mesmas
+            // rows). Paraleliza dentro da fase.
+            await Promise.all(
+              pairs.map(({ trainingId, memberId }) =>
+                setTrainingPayment(trainingId, memberId, null, 'no_payment', orgOpts).then(tick),
+              ),
+            )
           } else {
             // Pra "avulso" puro, o setMonthlyPayer(false) já fez o trabalho.
-            // Marca o restante como done.
-            done += pairs.length
-            setBulkProgress({ done, total })
+            // Avança o progresso no valor total restante.
+            setBulkProgress((prev) => prev ? { done: prev.done + pairs.length, total: prev.total } : null)
           }
         }
       } else if (action === 'status') {
         const status = value as 'pending' | 'paid' | 'no_payment'
-        for (const { trainingId, memberId } of pairs) {
-          await setTrainingPayment(trainingId, memberId, 'drop_in', status, orgOpts)
-          done++
-          setBulkProgress({ done, total })
-        }
+        // Paraleliza — cada par é independente.
+        await Promise.all(
+          pairs.map(({ trainingId, memberId }) =>
+            setTrainingPayment(trainingId, memberId, 'drop_in', status, orgOpts).then(tick),
+          ),
+        )
       }
 
       // Aplicou? Limpa seleção e fecha o sheet. Checkboxes continuam
