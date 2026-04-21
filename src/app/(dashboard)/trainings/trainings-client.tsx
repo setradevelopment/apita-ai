@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState, useTransition } from 'react'
+import { useMemo, useOptimistic, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   Calendar, CalendarOff, Check, X, MapPin, Clock, Users,
@@ -266,6 +266,159 @@ export function TrainingsClient({
   )
 }
 
+// ── Reducers de estado otimista ───────────────────────────────────────
+// Usados pelos `useOptimistic` dentro de CategoryView. Aplicam a mesma
+// transformação que o backend faria, pra UI refletir a mudança antes do
+// roundtrip. Quando o router.refresh() chega com dados novos do servidor,
+// o React descarta o estado otimista e mostra o real — sincronização
+// automática sem código de rollback.
+
+type AttendanceOp =
+  | { kind: 'set_status'; trainingId: string; memberId: string; status: string }
+  | { kind: 'set_payment'; trainingId: string; memberId: string; paymentType: string | null; paymentStatus: string }
+  | { kind: 'bulk_monthly_set'; memberId: string; trainingIds: string[] }
+  | { kind: 'bulk_monthly_unset'; memberId: string; trainingIds: string[] }
+
+function attendancesReducer(state: Attendance[], op: AttendanceOp): Attendance[] {
+  switch (op.kind) {
+    case 'set_status': {
+      const idx = state.findIndex(
+        (a) => a.training_id === op.trainingId && a.member_id === op.memberId,
+      )
+      if (idx >= 0) {
+        const next = [...state]
+        next[idx] = { ...state[idx], status: op.status }
+        return next
+      }
+      return [
+        ...state,
+        {
+          training_id: op.trainingId,
+          member_id: op.memberId,
+          status: op.status,
+          payment_type: 'drop_in',
+          payment_status: 'pending',
+        },
+      ]
+    }
+    case 'set_payment': {
+      const idx = state.findIndex(
+        (a) => a.training_id === op.trainingId && a.member_id === op.memberId,
+      )
+      if (idx >= 0) {
+        const next = [...state]
+        next[idx] = {
+          ...state[idx],
+          payment_type: op.paymentType,
+          payment_status: op.paymentStatus,
+        }
+        return next
+      }
+      return [
+        ...state,
+        {
+          training_id: op.trainingId,
+          member_id: op.memberId,
+          status: 'absent',
+          payment_type: op.paymentType,
+          payment_status: op.paymentStatus,
+        },
+      ]
+    }
+    case 'bulk_monthly_set': {
+      // Para cada training da lista: se existe row desse atleta, atualiza
+      // pra monthly+pending; senão cria nova row com status=absent (placeholder).
+      // Espelha o comportamento do setMonthlyPayer(true) server-side.
+      const existingSet = new Set<string>()
+      for (const a of state) {
+        if (a.member_id === op.memberId) existingSet.add(a.training_id)
+      }
+      const next = state.map((a) => {
+        if (a.member_id === op.memberId && op.trainingIds.includes(a.training_id)) {
+          return { ...a, payment_type: 'monthly', payment_status: 'pending' }
+        }
+        return a
+      })
+      for (const tid of op.trainingIds) {
+        if (!existingSet.has(tid)) {
+          next.push({
+            training_id: tid,
+            member_id: op.memberId,
+            status: 'absent',
+            payment_type: 'monthly',
+            payment_status: 'pending',
+          })
+        }
+      }
+      return next
+    }
+    case 'bulk_monthly_unset': {
+      return state.map((a) => {
+        if (
+          a.member_id === op.memberId &&
+          op.trainingIds.includes(a.training_id) &&
+          a.payment_type === 'monthly'
+        ) {
+          return { ...a, payment_type: 'drop_in', payment_status: 'pending' }
+        }
+        return a
+      })
+    }
+  }
+}
+
+type MonthlyPaymentOp =
+  | { kind: 'set_payer'; memberId: string; categoryId: string; month: number; year: number; isMonthlyPayer: boolean }
+  | { kind: 'set_status'; memberId: string; categoryId: string; month: number; year: number; status: string | null }
+
+function monthlyPaymentsReducer(
+  state: MonthlyPayment[],
+  op: MonthlyPaymentOp,
+): MonthlyPayment[] {
+  const idx = state.findIndex(
+    (mp) =>
+      mp.member_id === op.memberId &&
+      mp.category_id === op.categoryId &&
+      mp.month === op.month &&
+      mp.year === op.year,
+  )
+  switch (op.kind) {
+    case 'set_payer': {
+      if (idx >= 0) {
+        const next = [...state]
+        next[idx] = {
+          ...state[idx],
+          is_monthly_payer: op.isMonthlyPayer,
+          payment_status: op.isMonthlyPayer ? 'pending' : null,
+        }
+        return next
+      }
+      return [
+        ...state,
+        {
+          // id temporário — o real vem na próxima sincronização com o servidor.
+          id: `optimistic-${op.memberId}-${op.categoryId}-${op.month}-${op.year}`,
+          member_id: op.memberId,
+          category_id: op.categoryId,
+          month: op.month,
+          year: op.year,
+          is_monthly_payer: op.isMonthlyPayer,
+          payment_status: op.isMonthlyPayer ? 'pending' : null,
+          payment_note: null,
+        },
+      ]
+    }
+    case 'set_status': {
+      if (idx >= 0) {
+        const next = [...state]
+        next[idx] = { ...state[idx], payment_status: op.status }
+        return next
+      }
+      return state
+    }
+  }
+}
+
 // ── View por categoria ────────────────────────────────────────────────
 
 function CategoryView({
@@ -283,15 +436,26 @@ function CategoryView({
   const [isPending, startTransition] = useTransition()
   const { confirm } = useConfirm()
 
+  // Estado otimista: a UI reage ao clique ANTES do servidor responder.
+  // Quando router.refresh() traz props novas, o useOptimistic descarta
+  // as mudanças otimistas e mostra o real. Se o servidor falhar, a
+  // transição rejeita e o estado volta ao que era automaticamente.
+  const [optimisticAttendances, dispatchAttendance] = useOptimistic(
+    attendances,
+    attendancesReducer,
+  )
+  const [optimisticMonthlyPayments, dispatchMonthlyPayment] = useOptimistic(
+    monthlyPayments,
+    monthlyPaymentsReducer,
+  )
+
   // Mapa rápido member_id → monthly_payment pra decidir se é mensalista.
-  // Derivado direto das props — sem state local. Após cada ação chamamos
-  // `router.refresh()` pra o servidor reenviar dados novos. Trade-off:
-  // ~200ms de delay visual, mas zero complicação de sync.
+  // Derivado do estado otimista — reflete mudanças instantaneamente.
   const monthlyByMember = useMemo(() => {
     const m = new Map<string, MonthlyPayment>()
-    for (const mp of monthlyPayments) m.set(mp.member_id, mp)
+    for (const mp of optimisticMonthlyPayments) m.set(mp.member_id, mp)
     return m
-  }, [monthlyPayments])
+  }, [optimisticMonthlyPayments])
 
   // Subconjunto de `members` que são mensalistas no mês/ano atuais.
   // Alimenta a aba "Mensalistas" (só aparece se a categoria tiver
@@ -317,7 +481,7 @@ function CategoryView({
       paymentType: string | null
     }
     const rows: Row[] = []
-    for (const a of attendances) {
+    for (const a of optimisticAttendances) {
       if (a.payment_status !== 'awaiting_confirmation') continue
       const t = trainingById.get(a.training_id)
       if (!t) continue
@@ -334,7 +498,7 @@ function CategoryView({
     // Mais recente primeiro
     rows.sort((a, b) => b.trainingDate.localeCompare(a.trainingDate))
     return rows
-  }, [attendances, trainings, members])
+  }, [optimisticAttendances, trainings, members])
 
   const orgOpts = useMemo<TargetOrgOpts | undefined>(() => undefined, [])
 
@@ -342,6 +506,9 @@ function CategoryView({
 
   function handleAttendance(trainingId: string, memberId: string, status: 'present' | 'absent') {
     startTransition(async () => {
+      // Optimistic: atualiza a UI ANTES do servidor responder. Se o server
+      // falhar, a transição rejeita e o estado volta ao anterior automaticamente.
+      dispatchAttendance({ kind: 'set_status', trainingId, memberId, status })
       try {
         await setAttendance(trainingId, memberId, status, orgOpts)
         router.refresh()
@@ -353,6 +520,19 @@ function CategoryView({
 
   function handleToggleMonthlyPayer(memberId: string, makeItMonthly: boolean) {
     startTransition(async () => {
+      // Optimistic: flipa is_monthly_payer no row do atleta + cascateia pros
+      // attendances do mês (mesma regra do backend). IDs dos treinos vêm da
+      // prop `trainings` (já filtrada pela categoria ativa).
+      dispatchMonthlyPayment({
+        kind: 'set_payer', memberId, categoryId: category.id, month, year,
+        isMonthlyPayer: makeItMonthly,
+      })
+      const trainingIds = trainings.map((t) => t.id)
+      dispatchAttendance(
+        makeItMonthly
+          ? { kind: 'bulk_monthly_set', memberId, trainingIds }
+          : { kind: 'bulk_monthly_unset', memberId, trainingIds },
+      )
       try {
         await setMonthlyPayer(memberId, category.id, month, year, makeItMonthly, orgOpts)
         router.refresh()
@@ -364,6 +544,19 @@ function CategoryView({
 
   function handleMonthlyStatus(memberId: string, status: MonthlyStatus) {
     startTransition(async () => {
+      // Optimistic: status do row em monthly_payments + espelha nos
+      // attendances do mês (o setBulkPaymentStatus backend faz o mesmo).
+      dispatchMonthlyPayment({
+        kind: 'set_status', memberId, categoryId: category.id, month, year,
+        status,
+      })
+      const trainingIds = trainings.filter((t) => t.status !== 'cancelled').map((t) => t.id)
+      for (const tid of trainingIds) {
+        dispatchAttendance({
+          kind: 'set_payment', trainingId: tid, memberId,
+          paymentType: 'monthly', paymentStatus: status,
+        })
+      }
       try {
         // 1) Atualiza o row em monthly_payments (status do mês)
         await setPaymentStatus(memberId, category.id, month, year, status, orgOpts)
@@ -405,6 +598,13 @@ function CategoryView({
     }
 
     startTransition(async () => {
+      // Optimistic: pra status não-no_payment, tipo é drop_in; pra no_payment,
+      // tipo vira null (invariante tipo+status sem pagamento andam juntos).
+      dispatchAttendance({
+        kind: 'set_payment', trainingId, memberId,
+        paymentType: status === 'no_payment' ? null : 'drop_in',
+        paymentStatus: status,
+      })
       try {
         if (status === 'no_payment' || status === 'refunded') {
           // Status excepcionais → single-training via setBulkPaymentStatus
@@ -432,6 +632,10 @@ function CategoryView({
     setExemptState(null)
     setExemptReason('')
     startTransition(async () => {
+      dispatchAttendance({
+        kind: 'set_payment', trainingId, memberId,
+        paymentType: 'drop_in', paymentStatus: 'exempt',
+      })
       try {
         await setBulkPaymentStatus(
           memberId, category.id, trainingId, trainingDate,
@@ -453,11 +657,15 @@ function CategoryView({
   function handleSetPaymentType(
     trainingId: string, memberId: string, newType: 'drop_in' | null, currentStatus: string,
   ) {
+    // Se muda pra "sem pagamento" (newType=null), força status='no_payment'
+    // junto — a regra do owner é que tipo+status sem pagamento andam juntos.
+    const targetStatus = newType === null ? 'no_payment' : currentStatus
     startTransition(async () => {
+      dispatchAttendance({
+        kind: 'set_payment', trainingId, memberId,
+        paymentType: newType, paymentStatus: targetStatus,
+      })
       try {
-        // Se muda pra "sem pagamento" (newType=null), força status='no_payment'
-        // junto — a regra do owner é que tipo+status sem pagamento andam juntos.
-        const targetStatus = newType === null ? 'no_payment' : currentStatus
         await setTrainingPayment(
           trainingId, memberId, newType,
           targetStatus as 'pending' | 'paid' | 'no_payment' | 'refunded' | 'exempt',
@@ -499,6 +707,10 @@ function CategoryView({
     // Mensalistas são ignorados: o tipo do mês deles não muda por presença.
     if (status === 'present' && !isMonthly && currentPaymentStatus === 'no_payment') {
       startTransition(async () => {
+        dispatchAttendance({
+          kind: 'set_payment', trainingId, memberId,
+          paymentType: 'drop_in', paymentStatus: 'pending',
+        })
         try {
           await setTrainingPayment(trainingId, memberId, 'drop_in', 'pending', orgOpts)
           router.refresh()
@@ -527,6 +739,10 @@ function CategoryView({
     if (!shouldReset) return
 
     startTransition(async () => {
+      dispatchAttendance({
+        kind: 'set_payment', trainingId, memberId,
+        paymentType: null, paymentStatus: 'no_payment',
+      })
       try {
         await setBulkPaymentStatus(
           memberId, category.id, trainingId, trainingDate,
@@ -887,7 +1103,7 @@ function CategoryView({
                 training={t}
                 category={category}
                 members={members}
-                attendances={attendances}
+                attendances={optimisticAttendances}
                 monthlyByMember={monthlyByMember}
                 onAttendance={handleAttendanceWithPrompt}
                 onDropInStatus={handleDropInStatus}
